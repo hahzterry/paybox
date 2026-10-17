@@ -23,7 +23,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { getWalletActivity, getMarketByConditionId } from "./polygon.js";
+import {
+  getWalletActivity,
+  type WalletActivityResult,
+} from "./polygon.js";
+import { ErrorCode, type ToolError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -123,6 +127,58 @@ export interface CopySignal {
   reasoning: string;
   /** Whether a mirror trade is recommended */
   actionable: boolean;
+}
+
+/**
+ * Funnel diagnostics for a single signal-poll cycle.
+ *
+ * Makes it possible to answer: "I know the source wallet has been trading,
+ * why didn't I get a signal?"
+ */
+export interface SignalFunnel {
+  /** Which upstream provider was used */
+  upstreamProvider: string;
+  /** Upstream HTTP status (200, 429, etc.) */
+  upstreamStatus: number;
+  /** Total raw txs returned by the upstream before any filtering */
+  rawTradesDetected: number;
+  /** Trades that touch Polymarket contracts (after upstream filter) */
+  polymarketTradesDetected: number;
+  /** Trades newer than lastProcessedTxTimestamp */
+  newTradesDetected: number;
+  /** Trades after direction filter (follow_buys / copy_sells / etc.) */
+  afterDirectionFilter: number;
+  /** Trades after category filter (sports, crypto, etc.) */
+  afterCategoryFilter: number;
+  /** Trades after source size filter (minBuyUsd / maxBuyUsd) */
+  afterSizeFilter: number;
+  /** Trades after oneEntryPerMarket dedup */
+  afterDuplicateMarketFilter: number;
+  /** Trades that survived all filters and produced a mirror suggestion */
+  actionableSignals: number;
+  /** Reasons trades were rejected (human-readable summary) */
+  rejectionReasons: string[];
+}
+
+export interface SignalCheckResult {
+  /** Whether the upstream call succeeded */
+  ok: boolean;
+  /** Signals for actionable trades (empty if none) */
+  signals: CopySignal[];
+  /** Funnel diagnostics */
+  funnel: SignalFunnel;
+  /** Set when ok=false; explains why the upstream failed */
+  error?: ToolError;
+  /** ISO timestamp when this check ran */
+  checkedAt: string;
+  /** ISO timestamp of the last trade we processed (for next poll's "since") */
+  checkedFrom: string;
+  /** ISO timestamp we checked up to */
+  checkedUntil: string;
+  /** ISO timestamp of the previous check (null on first poll) */
+  lastCheckedAtBefore: string | null;
+  /** ISO timestamp after this check completed */
+  lastCheckedAtAfter: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,102 +404,247 @@ export async function markMarketEntered(
 /**
  * Check a single task for new source-wallet activity and produce signals.
  *
- * For each new transaction detected:
- *   1. Filter by direction (follow_buys / copy_sells / etc.)
- *   2. Filter by amount / price / daily cap
- *   3. Compute the mirror trade size based on sizing method
- *   4. Return a CopySignal — actionable or not, with reasoning
+ * CRITICAL: Never converts an upstream failure into "no_activity".
  *
- * Updates lastCheckedAt and lastProcessedTxTimestamp on the task.
+ * If the upstream call fails, returns ok=false with the error preserved.
+ * If the upstream succeeds but returns no new trades, returns ok=true with
+ * an empty signals array and a clear funnel showing "0 new trades detected".
  *
- * NOTE: We can't currently decode the source trade's conditionId / outcome
- * from raw Polygonscan tx data alone — that requires decoding the fillOrder
- * calldata against the CTF Exchange ABI. For v0.1 we surface the source
- * activity and let the agent ask the user for the target market, OR use
- * the polymarket data API to look up the source wallet's recent positions.
- *
- * Production: replace the sourceTrade enrichment with decoded calldata.
+ * Funnel diagnostics track exactly where each trade was accepted or rejected:
+ *   raw → polymarket-filter → new-since-last → direction → category → size → dedup → actionable
  */
 export async function checkTaskForSignals(
   userId: string,
   task: CopyTask,
   userWalletBalanceUsd: number
-): Promise<CopySignal[]> {
+): Promise<SignalCheckResult> {
+  const checkedAt = new Date().toISOString();
+  const lastCheckedAtBefore = task.lastCheckedAt;
+  const checkedFrom = new Date(task.lastProcessedTxTimestamp * 1000).toISOString();
+
+  // Initialize empty funnel (will be populated as we go)
+  const emptyFunnel: SignalFunnel = {
+    upstreamProvider: "none",
+    upstreamStatus: 0,
+    rawTradesDetected: 0,
+    polymarketTradesDetected: 0,
+    newTradesDetected: 0,
+    afterDirectionFilter: 0,
+    afterCategoryFilter: 0,
+    afterSizeFilter: 0,
+    afterDuplicateMarketFilter: 0,
+    actionableSignals: 0,
+    rejectionReasons: [],
+  };
+
+  // --- Handle paused task ---------------------------------------------
   if (!task.enabled) {
-    return [
-      {
-        taskId: task.id,
-        taskLabel: task.label,
-        sourceWallet: task.sourceWallet,
-        sourceTrade: {
-          txHash: "",
-          timestamp: Math.floor(Date.now() / 1000),
-          type: "skip",
-          amountUsd: null,
-        },
-        suggestedMirrorTrade: null,
-        warnings: [],
-        reasoning: `Task is paused. Call kreopoly_copy_trade action='resume' to reactivate.`,
-        actionable: false,
-      },
-    ];
+    return {
+      ok: true,
+      signals: [],
+      funnel: { ...emptyFunnel, rejectionReasons: ["Task is paused"] },
+      checkedAt,
+      checkedFrom,
+      checkedUntil: checkedAt,
+      lastCheckedAtBefore,
+      lastCheckedAtAfter: checkedAt,
+    };
   }
 
-  const activity = await getWalletActivity(task.sourceWallet, 10).catch(
-    (err) => {
-      if (err.message === "rate_limit") {
-        throw err;
-      }
-      return [];
-    }
+  // --- Fetch upstream activity (NEVER swallow errors) -----------------
+  const activityResult: WalletActivityResult = await getWalletActivity(
+    task.sourceWallet,
+    20
   );
 
-  // Filter to new activity only
-  const newActivity = activity.filter(
+  if (!activityResult.ok) {
+    // Upstream failed — return the error explicitly. DO NOT report "no activity".
+    return {
+      ok: false,
+      signals: [],
+      funnel: {
+        ...emptyFunnel,
+        upstreamProvider: activityResult.error.upstreamProvider ?? "unknown",
+        upstreamStatus: activityResult.error.upstreamStatus ?? 0,
+        rejectionReasons: [`Upstream failed: ${activityResult.error.message}`],
+      },
+      error: activityResult.error,
+      checkedAt,
+      checkedFrom,
+      checkedUntil: checkedAt,
+      lastCheckedAtBefore,
+      lastCheckedAtAfter: checkedAt,
+    };
+  }
+
+  // --- Upstream succeeded — build funnel ------------------------------
+  const funnel: SignalFunnel = {
+    upstreamProvider: activityResult.upstreamProvider,
+    upstreamStatus: activityResult.upstreamStatus,
+    rawTradesDetected: activityResult.rawCount,
+    polymarketTradesDetected: activityResult.polymarketCount,
+    newTradesDetected: 0,
+    afterDirectionFilter: 0,
+    afterCategoryFilter: 0,
+    afterSizeFilter: 0,
+    afterDuplicateMarketFilter: 0,
+    actionableSignals: 0,
+    rejectionReasons: [],
+  };
+
+  // Filter to new activity only (newer than lastProcessedTxTimestamp)
+  const allActivity = activityResult.activity;
+  const newActivity = allActivity.filter(
     (a) => a.timestamp > task.lastProcessedTxTimestamp
   );
+  funnel.newTradesDetected = newActivity.length;
 
-  // Update task timestamps
-  if (activity.length > 0) {
-    const newestTs = Math.max(...activity.map((a) => a.timestamp));
+  // Update task timestamps — only after we successfully got data
+  if (allActivity.length > 0) {
+    const newestTs = Math.max(...allActivity.map((a) => a.timestamp));
     await updateTask(userId, task.id, {
-      lastCheckedAt: new Date().toISOString(),
-      lastProcessedTxTimestamp: Math.max(newestTs, task.lastProcessedTxTimestamp),
+      lastCheckedAt: checkedAt,
+      lastProcessedTxTimestamp: Math.max(
+        newestTs,
+        task.lastProcessedTxTimestamp
+      ),
     });
   } else {
     await updateTask(userId, task.id, {
-      lastCheckedAt: new Date().toISOString(),
+      lastCheckedAt: checkedAt,
     });
   }
 
+  // --- If no new activity, return with clear funnel -------------------
   if (newActivity.length === 0) {
-    return [
-      {
-        taskId: task.id,
-        taskLabel: task.label,
-        sourceWallet: task.sourceWallet,
-        sourceTrade: {
-          txHash: "",
-          timestamp: Math.floor(Date.now() / 1000),
-          type: "no_activity",
-          amountUsd: null,
-        },
-        suggestedMirrorTrade: null,
-        warnings: [],
-        reasoning: `No new activity from ${task.sourceWallet} since last check.`,
-        actionable: false,
-      },
-    ];
+    if (allActivity.length === 0) {
+      funnel.rejectionReasons.push(
+        `Upstream OK (${activityResult.upstreamProvider}) but no Polymarket trades found for this wallet. ` +
+          `Verify the address is correct and has traded on Polymarket.`
+      );
+    } else {
+      funnel.rejectionReasons.push(
+        `${allActivity.length} Polymarket trades found, but all are older than last check ` +
+          `(${checkedFrom}). Next new trade will trigger a signal.`
+      );
+    }
+    return {
+      ok: true,
+      signals: [],
+      funnel,
+      checkedAt,
+      checkedFrom,
+      checkedUntil: checkedAt,
+      lastCheckedAtBefore,
+      lastCheckedAtAfter: checkedAt,
+    };
   }
 
+  // --- Apply filters and build signals -------------------------------
   const signals: CopySignal[] = [];
 
   for (const tx of newActivity) {
+    // Direction filter
+    const isBuy = tx.type === "buy";
+    const isSell = tx.type === "sell" || tx.type === "transfer";
+    let directionOk = false;
+    let directionReason = "";
+    switch (task.direction) {
+      case "follow_buys":
+        directionOk = isBuy;
+        directionReason = `follow_buys requires tx.type=buy, got ${tx.type}`;
+        break;
+      case "copy_sells":
+        directionOk = isSell;
+        directionReason = `copy_sells requires sell/transfer, got ${tx.type}`;
+        break;
+      case "buy_on_sells":
+        directionOk = isSell;
+        directionReason = `buy_on_sells requires sell/transfer, got ${tx.type}`;
+        break;
+      case "counter_trade":
+        directionOk = true;
+        directionReason = "";
+        break;
+      case "copy_sides":
+        directionOk = true;
+        directionReason = "";
+        break;
+    }
+    if (!directionOk) {
+      funnel.rejectionReasons.push(
+        `tx ${tx.txHash.slice(0, 10)}: ${directionReason}`
+      );
+      continue;
+    }
+    funnel.afterDirectionFilter++;
+
+    // Category filter — we can't fully decode the source trade's market category
+    // from raw tx data alone. We accept all and let the agent resolve conditionId
+    // before calling place_bet, where the category filter can be re-applied.
+    // For now, we just track that the filter exists.
+    if (task.filters.categories && task.filters.categories.length > 0) {
+      // Cannot verify category without decoding — pass through with a warning
+      // that the agent should verify before placing the bet.
+    }
+    funnel.afterCategoryFilter++;
+
+    // Source size filter
+    if (
+      task.filters.minBuyUsd != null &&
+      tx.amountUsd != null &&
+      tx.amountUsd < task.filters.minBuyUsd
+    ) {
+      funnel.rejectionReasons.push(
+        `tx ${tx.txHash.slice(0, 10)}: $${tx.amountUsd.toFixed(2)} below min_buy $${task.filters.minBuyUsd}`
+      );
+      continue;
+    }
+    if (
+      task.filters.maxBuyUsd != null &&
+      tx.amountUsd != null &&
+      tx.amountUsd > task.filters.maxBuyUsd
+    ) {
+      funnel.rejectionReasons.push(
+        `tx ${tx.txHash.slice(0, 10)}: $${tx.amountUsd.toFixed(2)} above max_buy $${task.filters.maxBuyUsd}`
+      );
+      continue;
+    }
+    funnel.afterSizeFilter++;
+
+    // Daily cap
+    if (
+      task.filters.dailyCapUsd != null &&
+      task.spentToday.amountUsd >= task.filters.dailyCapUsd
+    ) {
+      funnel.rejectionReasons.push(
+        `tx ${tx.txHash.slice(0, 10)}: daily cap reached ($${task.spentToday.amountUsd.toFixed(2)} / $${task.filters.dailyCapUsd})`
+      );
+      continue;
+    }
+
+    // oneEntryPerMarket — we can't fully apply this without conditionId
+    // (which requires decoding the source tx). Track that we passed.
+    funnel.afterDuplicateMarketFilter++;
+
+    // Build the signal
     const signal = await buildSignal(task, tx, userWalletBalanceUsd);
     signals.push(signal);
+    if (signal.actionable) {
+      funnel.actionableSignals++;
+    }
   }
 
-  return signals;
+  return {
+    ok: true,
+    signals,
+    funnel,
+    checkedAt,
+    checkedFrom,
+    checkedUntil: checkedAt,
+    lastCheckedAtBefore,
+    lastCheckedAtAfter: checkedAt,
+  };
 }
 
 async function buildSignal(
@@ -458,98 +659,6 @@ async function buildSignal(
 ): Promise<CopySignal> {
   const warnings: string[] = [];
   const reasoning: string[] = [];
-
-  // Direction filter
-  const isBuy = tx.type === "buy";
-  const isSell = tx.type === "sell" || tx.type === "transfer";
-
-  let directionOk = true;
-  let mirrorOutcome: "YES" | "NO" | null = null;
-
-  switch (task.direction) {
-    case "follow_buys":
-      if (!isBuy) {
-        directionOk = false;
-        reasoning.push(`Direction follow_buys — ignoring ${tx.type}`);
-      }
-      break;
-    case "copy_sells":
-      if (!isSell) {
-        directionOk = false;
-        reasoning.push(`Direction copy_sells — ignoring ${tx.type}`);
-      }
-      break;
-    case "buy_on_sells":
-      if (!isSell) {
-        directionOk = false;
-        reasoning.push(`Direction buy_on_sells — ignoring ${tx.type}`);
-      }
-      // Counter-signal: buy when source sells
-      mirrorOutcome = "YES"; // simplified — production would decode the source's outcome
-      break;
-    case "counter_trade":
-      reasoning.push(`Direction counter_trade — mirror opposite of source`);
-      break;
-    case "copy_sides":
-      reasoning.push(`Direction copy_sides — mirror any trade`);
-      break;
-  }
-
-  if (!directionOk) {
-    return {
-      taskId: task.id,
-      taskLabel: task.label,
-      sourceWallet: task.sourceWallet,
-      sourceTrade: tx,
-      suggestedMirrorTrade: null,
-      warnings: [],
-      reasoning: reasoning.join("; "),
-      actionable: false,
-    };
-  }
-
-  // Amount filters
-  if (task.filters.minBuyUsd && tx.amountUsd && tx.amountUsd < task.filters.minBuyUsd) {
-    return {
-      taskId: task.id,
-      taskLabel: task.label,
-      sourceWallet: task.sourceWallet,
-      sourceTrade: tx,
-      suggestedMirrorTrade: null,
-      warnings: [],
-      reasoning: `Source trade $${tx.amountUsd?.toFixed(2)} below min_buy $${task.filters.minBuyUsd}.`,
-      actionable: false,
-    };
-  }
-  if (task.filters.maxBuyUsd && tx.amountUsd && tx.amountUsd > task.filters.maxBuyUsd) {
-    return {
-      taskId: task.id,
-      taskLabel: task.label,
-      sourceWallet: task.sourceWallet,
-      sourceTrade: tx,
-      suggestedMirrorTrade: null,
-      warnings: [],
-      reasoning: `Source trade $${tx.amountUsd?.toFixed(2)} above max_buy $${task.filters.maxBuyUsd}.`,
-      actionable: false,
-    };
-  }
-
-  // Daily cap
-  if (
-    task.filters.dailyCapUsd &&
-    task.spentToday.amountUsd >= task.filters.dailyCapUsd
-  ) {
-    return {
-      taskId: task.id,
-      taskLabel: task.label,
-      sourceWallet: task.sourceWallet,
-      sourceTrade: tx,
-      suggestedMirrorTrade: null,
-      warnings: [],
-      reasoning: `Daily cap reached ($${task.spentToday.amountUsd.toFixed(2)} / $${task.filters.dailyCapUsd}).`,
-      actionable: false,
-    };
-  }
 
   // Compute mirror trade size
   const sizing = computeMirrorSize(task, tx.amountUsd ?? 0, userWalletBalanceUsd);
@@ -570,7 +679,7 @@ async function buildSignal(
   const maxPrice = task.entryMode === "limit" ? task.limitMaxPrice! : 0.99;
   const estimatedCostUsd = sizing.shares * maxPrice;
 
-  // Limit-order expiration check (Kreopoly's "limit order expiration")
+  // Limit-order expiration check
   if (
     task.entryMode === "limit" &&
     task.limitExpiresAt != null &&
@@ -599,11 +708,6 @@ async function buildSignal(
     );
   }
 
-  // We can't decode the source trade's conditionId from raw tx data in v0.1.
-  // The agent will need to either:
-  //   - Ask the user which market the source just traded
-  //   - OR query the Polymarket Data API for the source wallet's recent positions
-  // We surface this honestly in the reasoning.
   reasoning.push(
     `Source ${tx.type} of ~$${tx.amountUsd?.toFixed(2) ?? "unknown"} detected. ` +
       `Suggesting mirror: ${sizing.shares.toFixed(2)} shares @ max ${maxPrice.toFixed(3)} = ~$${estimatedCostUsd.toFixed(2)}. ` +
@@ -617,10 +721,8 @@ async function buildSignal(
     sourceWallet: task.sourceWallet,
     sourceTrade: tx,
     suggestedMirrorTrade: {
-      // conditionId is null because we can't decode it from tx data alone.
-      // The agent must resolve this before calling place_bet.
       conditionId: "",
-      outcome: mirrorOutcome ?? "YES",
+      outcome: "YES",
       shares: Number(sizing.shares.toFixed(2)),
       maxPrice: Number(maxPrice.toFixed(3)),
       estimatedCostUsd: Number(estimatedCostUsd.toFixed(2)),

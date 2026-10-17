@@ -1,22 +1,26 @@
 /**
  * tools/checkCopySignals.ts
  *
- * Polls all (or one) copy task's source wallet for new activity and returns
- * any pending mirror-trade signals. The agent should call this periodically
- * (e.g. every 30–60 seconds during a demo, or on user prompt).
+ * READ-ONLY: polls copy tasks for new source-wallet activity and returns
+ * pending mirror-trade signals along with detailed funnel diagnostics.
  *
- * For each actionable signal, the agent should:
- *   1. Read the suggested mirror trade (shares, maxPrice, outcome)
- *   2. Resolve the conditionId (Polymarket Data API for source wallet's latest position)
- *   3. Present the cost breakdown to the user
- *   4. Call kreopoly_place_bet to get a signing_request
- *   5. Forward to PayBox's request_wallet_sign
+ * Does NOT sign, does NOT transact, does NOT move funds. Returns signals
+ * that the agent should evaluate; if actionable, the agent calls
+ * kreopoly_place_bet (which returns a signing_request for PayBox).
  *
- * The plugin does NOT auto-execute — the agent orchestrates each mirror.
+ * CRITICAL: Returns ok=false with a structured error if the upstream
+ * activity fetch fails. Never reports "no signals" when the upstream
+ * actually failed.
  */
 
 import { z } from "zod";
-import { listTasks, checkTaskForSignals, getTask } from "../lib/copyTasks.js";
+import {
+  listTasks,
+  checkTaskForSignals,
+  getTask,
+  type SignalCheckResult,
+  type CopyTask,
+} from "../lib/copyTasks.js";
 import { getUsdcEBalance } from "../lib/polygon.js";
 
 export const checkCopySignalsSchema = z.object({
@@ -33,7 +37,7 @@ export const checkCopySignalsSchema = z.object({
     .optional()
     .describe(
       "User's Polygon wallet (for sizing methods 'percent' or 'portfolio_weighted'). " +
-        "Omit for 'fixed' or 'exact' sizing."
+        "Omit for 'fixed' or 'exact' sizing. Read-only — public balance check, no signing."
     ),
 });
 
@@ -42,15 +46,19 @@ export type CheckCopySignalsArgs = z.infer<typeof checkCopySignalsSchema>;
 export const checkCopySignalsTool = {
   name: "kreopoly_check_copy_signals",
   description:
-    "Poll copy tasks for new source-wallet activity and return pending mirror-trade signals. " +
-    "Call periodically. For each actionable signal: resolve conditionId via Polymarket " +
-    "Data API, present cost to user, then call kreopoly_place_bet → PayBox request_wallet_sign. " +
-    "Free read (rate-limited by Polygonscan).",
+    "[READ-ONLY] [NO SIGNATURE] [NO TRANSACTION] [NO FUND MOVEMENT] " +
+    "Poll copy tasks for new source-wallet activity and return pending mirror-trade " +
+    "signals with detailed funnel diagnostics. Read-only — reads public on-chain " +
+    "data via Polygonscan/Polymarket API, no signing, no fund movement. " +
+    "For each actionable signal: resolve conditionId via Polymarket Data API, " +
+    "present cost to user, then call kreopoly_place_bet → PayBox request_wallet_sign. " +
+    "If upstream activity fetch fails, returns ok=false with the error — do NOT " +
+    "treat as 'no signals'.",
   inputSchema: checkCopySignalsSchema,
   handler: async (args: CheckCopySignalsArgs, ctx: { userId: string }) => {
     const userId = ctx.userId || "anonymous";
 
-    let tasks;
+    let tasks: CopyTask[];
     if (args.taskId) {
       const t = await getTask(userId, args.taskId);
       tasks = t ? [t] : [];
@@ -60,8 +68,10 @@ export const checkCopySignalsTool = {
 
     if (tasks.length === 0) {
       return {
-        ok: false,
-        message:
+        ok: true,
+        checkedTasks: 0,
+        results: [],
+        hint:
           "No copy tasks found. Use kreopoly_copy_trade action='create' to set one up.",
       };
     }
@@ -73,37 +83,65 @@ export const checkCopySignalsTool = {
       userBalanceUsd = Number(balStr);
     }
 
-    const allSignals = [];
-    const errors = [];
+    // Run each task's signal check, preserving task ID even when signals is empty
+    const taskResults: Array<{
+      task: { id: string; label: string; sourceWallet: string; enabled: boolean };
+      check: SignalCheckResult;
+    }> = [];
 
     for (const task of tasks) {
-      try {
-        const signals = await checkTaskForSignals(userId, task, userBalanceUsd);
-        allSignals.push(...signals);
-      } catch (err: any) {
-        errors.push({
-          taskId: task.id,
-          taskLabel: task.label,
-          error: err.message,
-        });
-      }
+      const check = await checkTaskForSignals(userId, task, userBalanceUsd);
+      taskResults.push({
+        task: {
+          id: task.id,
+          label: task.label,
+          sourceWallet: task.sourceWallet,
+          enabled: task.enabled,
+        },
+        check,
+      });
     }
 
-    const actionable = allSignals.filter((s) => s.actionable);
+    const totalSignals = taskResults.reduce(
+      (s, tr) => s + (tr.check.ok ? tr.check.signals.length : 0),
+      0
+    );
+    const actionableSignals = taskResults.reduce(
+      (s, tr) =>
+        s +
+        (tr.check.ok
+          ? tr.check.signals.filter((sig) => sig.actionable).length
+          : 0),
+      0
+    );
+    const failedTasks = taskResults.filter((tr) => !tr.check.ok).length;
 
     return {
       ok: true,
-      checkedTasks: tasks.length,
-      totalSignals: allSignals.length,
-      actionableSignals: actionable.length,
-      signals: allSignals,
-      errors: errors.length > 0 ? errors : undefined,
+      checkedTasks: taskResults.length,
+      failedTasks,
+      totalSignals,
+      actionableSignals,
+      results: taskResults.map((tr) => ({
+        task: tr.task,
+        ok: tr.check.ok,
+        checkedAt: tr.check.checkedAt,
+        checkedFrom: tr.check.checkedFrom,
+        checkedUntil: tr.check.checkedUntil,
+        lastCheckedAtBefore: tr.check.lastCheckedAtBefore,
+        lastCheckedAtAfter: tr.check.lastCheckedAtAfter,
+        signals: tr.check.ok ? tr.check.signals : [],
+        funnel: tr.check.funnel,
+        error: tr.check.ok ? undefined : tr.check.error,
+      })),
       hint:
-        actionable.length > 0
-          ? `${actionable.length} actionable signal(s). For each: (1) resolve conditionId via Polymarket Data API for source wallet's latest position, (2) present cost to user, (3) call kreopoly_place_bet, (4) forward signing_request to PayBox request_wallet_sign.`
-          : allSignals.length === 0
-            ? "No signals — no new source activity. Try again in 30–60s."
-            : undefined,
+        actionableSignals > 0
+          ? `${actionableSignals} actionable signal(s). For each: (1) resolve conditionId via Polymarket Data API for source wallet's latest position, (2) present cost to user, (3) call kreopoly_place_bet, (4) forward signing_request to PayBox request_wallet_sign.`
+          : failedTasks > 0
+            ? `${failedTasks} task(s) failed to fetch activity — see per-task error fields. Do NOT treat as "no signals".`
+            : totalSignals === 0
+              ? "No signals — see per-task funnel for rejection reasons. Upstream confirmed OK."
+              : undefined,
     };
   },
 };

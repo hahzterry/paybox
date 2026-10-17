@@ -18,6 +18,8 @@ import {
   type ListToolsRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "./lib/zodToJsonSchema.js";
+import { normalizeCopyTradeArgs, formatZodError } from "./lib/schemaNormalize.js";
+import { makeError, ErrorCode } from "./lib/errors.js";
 
 import { getPositionsTool, getPositionsSchema } from "./tools/getPositions.js";
 import { trackWalletTool, trackWalletSchema } from "./tools/trackWallet.js";
@@ -128,7 +130,7 @@ export function createServer(): Server {
     CallToolRequestSchema,
     async (req: CallToolRequest) => {
       const name = req.params.name;
-      const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+      let args = (req.params.arguments ?? {}) as Record<string, unknown>;
       const ctx = {
         // PayBox passes the user id via the _meta context. Fall back to env.
         userId:
@@ -143,20 +145,57 @@ export function createServer(): Server {
           content: [
             {
               type: "text",
-              text: `Unknown tool: ${name}. Available: ${TOOLS.map((t) => t.name).join(", ")}`,
+              text: JSON.stringify(
+                makeError(
+                  ErrorCode.INVALID_PARAMETERS,
+                  `Unknown tool: ${name}. Available: ${TOOLS.map((t) => t.name).join(", ")}`,
+                  { retryable: false }
+                ),
+                null,
+                2
+              ),
             },
           ],
           isError: true,
         };
       }
 
+      // Apply alias normalization for tools that have known alias patterns
+      if (name === "kreopoly_copy_trade") {
+        args = normalizeCopyTradeArgs(args);
+      }
+      // For place_bet / settle_position: accept walletAddress as alias for accountAddress
+      if (name === "kreopoly_place_bet" || name === "kreopoly_settle_position") {
+        if (args.walletAddress && !args.accountAddress) {
+          args.accountAddress = args.walletAddress;
+          delete args.walletAddress;
+        }
+        if (args.userWalletAddress && !args.accountAddress) {
+          args.accountAddress = args.userWalletAddress;
+          delete args.userWalletAddress;
+        }
+      }
+
       const parsed = tool.schema.safeParse(args);
       if (!parsed.success) {
+        const zodErrors = (parsed.error as any).errors ?? parsed.error.issues ?? [];
+        const formatted = formatZodError(
+          zodErrors.map((e: any) => ({
+            path: e.path ?? [],
+            message: e.message,
+          }))
+        );
         return {
           content: [
             {
               type: "text",
-              text: `Invalid arguments: ${parsed.error.message}`,
+              text: JSON.stringify(
+                makeError(ErrorCode.INVALID_PARAMETERS, formatted, {
+                  retryable: false,
+                }),
+                null,
+                2
+              ),
             },
           ],
           isError: true,
@@ -179,7 +218,15 @@ export function createServer(): Server {
           content: [
             {
               type: "text",
-              text: `Tool ${name} failed: ${err.message}`,
+              text: JSON.stringify(
+                makeError(
+                  ErrorCode.INTERNAL_ERROR,
+                  `Tool ${name} threw: ${err?.message ?? String(err)}`,
+                  { retryable: false }
+                ),
+                null,
+                2
+              ),
             },
           ],
           isError: true,

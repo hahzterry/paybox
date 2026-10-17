@@ -1,16 +1,22 @@
 /**
  * tools/getTrackedActivity.ts
  *
- * Fetches recent on-chain activity for every wallet in the user's watchlist.
- * Mirrors Kreopoly's wallet-alert feature: "0x9e1f...a33c bought YES 'US
- * election outcome' size: $4,200 @ 0.71".
+ * READ-ONLY: fetches recent on-chain Polymarket activity for every wallet in
+ * the user's watchlist. Mirrors Kreopoly's wallet-alert feature.
  *
- * Uses the Polygonscan free tier. Set POLYGONSCAN_API_KEY to lift rate limits.
+ * Does NOT sign, does NOT transact, does NOT require wallet permission.
+ * Reads public Polygon blockchain data via Polygonscan + Polymarket Data API.
+ *
+ * CRITICAL: If the upstream provider fails for a wallet, that wallet's
+ * `error` field is populated and `activity` is empty — but the overall
+ * response still returns ok=true IF at least one wallet succeeded. If ALL
+ * wallets fail, returns ok=false with the most informative error.
  */
 
 import { z } from "zod";
 import { listWallets } from "../lib/store.js";
-import { getWalletActivity, type WalletActivity } from "../lib/polygon.js";
+import { getWalletActivity } from "../lib/polygon.js";
+import { makeError, ErrorCode, type ToolError } from "../lib/errors.js";
 
 export const getTrackedActivitySchema = z.object({
   /** Max activities to return per wallet (default 5) */
@@ -28,9 +34,11 @@ export type GetTrackedActivityArgs = z.infer<typeof getTrackedActivitySchema>;
 export const getTrackedActivityTool = {
   name: "kreopoly_get_tracked_activity",
   description:
+    "[READ-ONLY] [NO SIGNATURE] [NO TRANSACTION] [NO FUND MOVEMENT] " +
     "Fetch recent Polymarket activity for every wallet in the user's watchlist. " +
-    "Use this to surface smart-money moves to the user. Free read " +
-    "(rate-limited by Polygonscan; set POLYGONSCAN_API_KEY to lift).",
+    "Reads public on-chain data via Polygonscan (with Polymarket Data API fallback). " +
+    "If a wallet's upstream fetch fails, that wallet's `error` field is populated — " +
+    "do NOT treat empty `activity` as 'no trades' without checking `error` first.",
   inputSchema: getTrackedActivitySchema,
   handler: async (
     args: GetTrackedActivityArgs,
@@ -41,8 +49,11 @@ export const getTrackedActivityTool = {
 
     if (wallets.length === 0) {
       return {
-        ok: false,
-        message:
+        ok: true,
+        walletsChecked: 0,
+        totalActivity: 0,
+        results: [],
+        hint:
           "Watchlist is empty. Use kreopoly_track_wallet to add wallets first.",
       };
     }
@@ -50,37 +61,73 @@ export const getTrackedActivityTool = {
     const sinceTs = Math.floor(Date.now() / 1000) - args.sinceSeconds;
     const results: Array<{
       wallet: { address: string; label: string };
-      activity: WalletActivity[];
-      error?: string;
+      activity: import("../lib/polygon.js").WalletActivity[];
+      upstreamProvider?: string;
+      upstreamStatus?: number;
+      rawCount?: number;
+      polymarketCount?: number;
+      error?: ToolError;
     }> = [];
+
+    let totalActivity = 0;
+    let failureCount = 0;
+    let lastError: ToolError | null = null;
 
     for (const w of wallets) {
       if (!w.enabled) continue;
-      try {
-        const activity = await getWalletActivity(w.address, args.perWallet);
-        const recent = activity.filter((a) => a.timestamp >= sinceTs);
-        results.push({ wallet: { address: w.address, label: w.label }, activity: recent });
-      } catch (err: any) {
+      const result = await getWalletActivity(w.address, args.perWallet);
+
+      if (!result.ok) {
+        failureCount++;
+        lastError = result.error;
         results.push({
           wallet: { address: w.address, label: w.label },
           activity: [],
-          error: err.message,
+          error: result.error,
         });
+        continue;
       }
+
+      const recent = result.activity.filter((a) => a.timestamp >= sinceTs);
+      totalActivity += recent.length;
+      results.push({
+        wallet: { address: w.address, label: w.label },
+        activity: recent,
+        upstreamProvider: result.upstreamProvider,
+        upstreamStatus: result.upstreamStatus,
+        rawCount: result.rawCount,
+        polymarketCount: result.polymarketCount,
+      });
     }
 
-    const totalActivity = results.reduce((s, r) => s + r.activity.length, 0);
+    // If ALL wallets failed, return an error response
+    if (failureCount === wallets.length && lastError) {
+      return makeError(
+        lastError.code,
+        `All ${wallets.length} wallet(s) failed to fetch activity. Last error: ${lastError.message}`,
+        {
+          retryable: lastError.retryable,
+          upstreamStatus: lastError.upstreamStatus,
+          upstreamProvider: lastError.upstreamProvider,
+          upstreamContentType: lastError.upstreamContentType,
+          upstreamPreview: lastError.upstreamPreview,
+        }
+      );
+    }
 
     return {
       ok: true,
       since: new Date(sinceTs * 1000).toISOString(),
       walletsChecked: results.length,
+      walletsFailed: failureCount,
       totalActivity,
       results,
       hint:
-        totalActivity === 0
-          ? "No recent activity from tracked wallets. Try increasing sinceSeconds."
-          : undefined,
+        totalActivity === 0 && failureCount > 0
+          ? `${failureCount} wallet(s) failed to fetch — see per-wallet error fields.`
+          : totalActivity === 0
+            ? "No recent activity from tracked wallets. Try increasing sinceSeconds."
+            : undefined,
     };
   },
 };

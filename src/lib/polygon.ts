@@ -10,9 +10,14 @@
  *   - Polygonscan API (wallet activity tracking)
  *
  * This module performs ONLY reads. Trade construction lives in tools/placeBet.ts.
+ *
+ * All HTTP calls go through safeFetch() — never blindly calls .json().
+ * Returns structured results: { ok: true, data } | { ok: false, error: ToolError }.
  */
 
 import { ethers } from "ethers";
+import { safeFetch, type SafeFetchResult } from "./safeFetch.js";
+import { ErrorCode, type ToolError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Contract addresses (Polygon mainnet, chainId 137)
@@ -133,53 +138,65 @@ export interface MarketMeta {
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
+export type MarketResult = { ok: true; market: MarketMeta | null } | { ok: false; error: ToolError };
+
 /**
- * Look up a market by its conditionId. Returns null if not found.
+ * Look up a market by its conditionId.
  *
- * The Gamma API exposes `/markets?condition_ids=<id>` which returns an array.
- * We pick the first match and normalize it.
+ * Returns:
+ *   - { ok: true, market: MarketMeta } if found
+ *   - { ok: true, market: null } if the API succeeded but no market matched
+ *   - { ok: false, error: ToolError } if the upstream call failed
  */
 export async function getMarketByConditionId(
   conditionId: string
-): Promise<MarketMeta | null> {
+): Promise<MarketResult> {
   const url = `${GAMMA_BASE}/markets?condition_ids=${encodeURIComponent(conditionId)}&limit=1`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) {
-    throw new Error(`gamma_api_error status=${res.status}`);
+  const result = await safeFetch(url, {
+    provider: "polymarket-gamma",
+    headers: { accept: "application/json" },
+  });
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const data = result.data;
+  if (!Array.isArray(data) || data.length === 0) {
+    return { ok: true, market: null };
   }
-  const data = (await res.json()) as any[];
-  if (!Array.isArray(data) || data.length === 0) return null;
-  return normalizeGammaMarket(data[0]);
+  return { ok: true, market: normalizeGammaMarket(data[0]) };
 }
 
 /**
  * Look up markets by an array of ERC-1155 tokenIds.
  *
  * Polymarket's Gamma API does not directly index by tokenId, but each market
- * carries an array of clobTokenIds. We fetch the user's active markets via the
- * Polymarket Data API (`/positions`) and resolve metadata from there.
- *
- * For wallets not connected to Polymarket's data API, we fall back to scanning
- * the user's ERC-1155 transfer history and matching tokenId → market via
- * Gamma's `/markets` endpoint with cursor pagination.
+ * carries an array of clobTokenIds. We fetch recent markets and match.
  */
 export async function getMarketByTokenId(
   tokenId: string
-): Promise<MarketMeta | null> {
-  // Gamma does not support direct tokenId lookup. We approximate by walking
-  // recent markets and matching. For demo / hackathon purposes this is fine.
-  // In production, replace with the official Polymarket Data API.
+): Promise<MarketResult> {
   const url = `${GAMMA_BASE}/markets?closed=false&limit=500&order=volume24hr&ascending=false`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) {
-    throw new Error(`gamma_api_error status=${res.status}`);
+  const result = await safeFetch(url, {
+    provider: "polymarket-gamma",
+    headers: { accept: "application/json" },
+  });
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const data = result.data;
+  if (!Array.isArray(data)) {
+    return { ok: false, error: {
+      code: ErrorCode.UPSTREAM_INVALID_RESPONSE,
+      message: "polymarket-gamma: expected array response",
+      retryable: false,
+      upstreamProvider: "polymarket-gamma",
+    }};
   }
-  const data = (await res.json()) as any[];
   for (const m of data) {
     const normalized = normalizeGammaMarket(m);
-    if (normalized.outcomeTokenIds.includes(tokenId)) return normalized;
+    if (normalized.outcomeTokenIds.includes(tokenId)) {
+      return { ok: true, market: normalized };
+    }
   }
-  return null;
+  return { ok: true, market: null };
 }
 
 function normalizeGammaMarket(m: any): MarketMeta {
@@ -243,61 +260,136 @@ export async function getUsdcEBalance(walletAddress: string): Promise<string> {
 /**
  * Get a wallet's open Polymarket positions.
  *
- * Strategy (hackathon-grade, no auth):
- *   1. Query Polymarket Data API: https://data-api.polymarket.com/positions?user=<addr>
- *      This returns the user's positions with size, avg price, current price,
- *      and full market metadata in one call. Free, no auth.
- *   2. If the Data API is unavailable, fall back to scanning ERC-1155 balances
- *      via the ConditionalTokens contract — but this requires knowing tokenIds
- *      in advance, which is why the Data API is the primary path.
+ * READ-ONLY: no signature, no transaction, no fund movement.
+ *
+ * Returns:
+ *   - { ok: true, positions: Position[], upstreamProvider, upstreamStatus } on success
+ *   - { ok: false, error: ToolError } if the upstream call failed
+ *
+ * Never returns an empty array silently when the upstream failed — that would
+ * create a false negative. The caller can distinguish "no positions" (ok=true,
+ * positions=[]) from "upstream failed" (ok=false).
  */
-export async function getPositions(walletAddress: string): Promise<Position[]> {
-  // Primary: Polymarket Data API
+export type PositionsResult =
+  | { ok: true; positions: Position[]; upstreamProvider: string; upstreamStatus: number }
+  | { ok: false; error: ToolError };
+
+export async function getPositions(walletAddress: string): Promise<PositionsResult> {
   const url = `https://data-api.polymarket.com/positions?user=${encodeURIComponent(
     walletAddress.toLowerCase()
   )}&sizeThreshold=0.1&limit=100`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (res.ok) {
-    const data = (await res.json()) as any[];
-    if (Array.isArray(data)) {
-      return data
-        .filter((p) => Number(p.size ?? 0) > 0)
-        .map((p) => ({
-          tokenId: String(p.asset ?? p.tokenId ?? ""),
-          shares: String(p.size ?? "0"),
-          outcome: p.outcome ?? (Number(p.side) === 0 ? "YES" : "NO"),
-          marketTitle: p.title ?? p.market ?? p.question ?? "Unknown market",
-          currentPrice: Number(p.currentPrice ?? p.price ?? 0) || 0,
-          currentValueUsd: Number(p.currentValue ?? 0) || 0,
-          marketSlug: p.slug ?? p.marketSlug ?? "",
-          marketEndDate: p.endDate
-            ? Math.floor(new Date(p.endDate).getTime() / 1000)
-            : null,
-        }));
-    }
+
+  const result = await safeFetch(url, {
+    provider: "polymarket-data-api",
+    headers: { accept: "application/json" },
+  });
+
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const data = result.data;
+  if (!Array.isArray(data)) {
+    return {
+      ok: false,
+      error: {
+        code: ErrorCode.UPSTREAM_INVALID_RESPONSE,
+        message: "polymarket-data-api: expected array response",
+        retryable: false,
+        upstreamProvider: "polymarket-data-api",
+        upstreamStatus: result.status,
+      },
+    };
   }
 
-  // Fallback: empty result. (Production would scan ERC-1155 transfers.)
-  return [];
+  const positions: Position[] = data
+    .filter((p) => Number(p.size ?? 0) > 0)
+    .map((p) => ({
+      tokenId: String(p.asset ?? p.tokenId ?? ""),
+      shares: String(p.size ?? "0"),
+      outcome: p.outcome ?? (Number(p.side) === 0 ? "YES" : "NO"),
+      marketTitle: p.title ?? p.market ?? p.question ?? "Unknown market",
+      currentPrice: Number(p.currentPrice ?? p.price ?? 0) || 0,
+      currentValueUsd: Number(p.currentValue ?? 0) || 0,
+      marketSlug: p.slug ?? p.marketSlug ?? "",
+      marketEndDate: p.endDate
+        ? Math.floor(new Date(p.endDate).getTime() / 1000)
+        : null,
+    }));
+
+  return {
+    ok: true,
+    positions,
+    upstreamProvider: "polymarket-data-api",
+    upstreamStatus: result.status,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Wallet activity tracking (Polygonscan)
+// Wallet activity tracking (Polygonscan + Polymarket Data API fallback)
 // ---------------------------------------------------------------------------
 
 const POLYGONSCAN_BASE = "https://api.polygonscan.com/api";
+const POLYMARKET_ACTIVITY_BASE = "https://data-api.polymarket.com";
+
+/**
+ * Result of fetching wallet activity.
+ *
+ * ok=true with activity=[] means: upstream confirmed OK, no matching trades found.
+ * ok=false means: upstream failed; do NOT treat as "no activity".
+ */
+export type WalletActivityResult =
+  | {
+      ok: true;
+      activity: WalletActivity[];
+      upstreamProvider: string;
+      upstreamStatus: number;
+      /** How many raw txs were returned by the upstream before filtering */
+      rawCount: number;
+      /** How many txs remained after filtering to Polymarket contracts */
+      polymarketCount: number;
+    }
+  | { ok: false; error: ToolError };
 
 /**
  * Fetch recent Polymarket-related transactions for a wallet.
  *
- * Uses Polygonscan's `txlist` endpoint (free tier: 5 req/s, 100k/day).
- * Filters to transactions that touch the CTF Exchange or ConditionalTokens
- * contract. Returns up to `limit` items, newest first.
+ * READ-ONLY: no signature, no transaction, no fund movement.
+ *
+ * Strategy:
+ *   1. Try Polygonscan `txlist` endpoint — returns txs from the wallet
+ *   2. Filter to txs touching Polymarket contracts (CTF Exchange, ConditionalTokens, NegRisk)
+ *   3. If Polygonscan fails (HTML, rate limit, WAF), fall back to Polymarket
+ *      Data API's `/activity` endpoint
+ *
+ * NEVER returns an empty array silently when the upstream failed.
  */
 export async function getWalletActivity(
   walletAddress: string,
   limit = 20
-): Promise<WalletActivity[]> {
+): Promise<WalletActivityResult> {
+  // --- Attempt 1: Polygonscan -----------------------------------------
+  const polygonscanResult = await getWalletActivityFromPolygonscan(
+    walletAddress,
+    limit
+  );
+  if (polygonscanResult.ok) return polygonscanResult;
+
+  // If Polygonscan failed with a hard error (invalid response, not just rate
+  // limit), try the Polymarket Data API as a fallback.
+  const polymarketResult = await getWalletActivityFromPolymarket(
+    walletAddress,
+    limit
+  );
+  if (polymarketResult.ok) return polymarketResult;
+
+  // Both failed — return the more informative error (prefer Polygonscan's
+  // since that's the primary provider).
+  return polygonscanResult;
+}
+
+async function getWalletActivityFromPolygonscan(
+  walletAddress: string,
+  limit: number
+): Promise<WalletActivityResult> {
   const apiKey = process.env.POLYGONSCAN_API_KEY ?? "";
   const params = new URLSearchParams({
     module: "account",
@@ -312,18 +404,41 @@ export async function getWalletActivity(
   if (apiKey) params.set("apikey", apiKey);
 
   const url = `${POLYGONSCAN_BASE}?${params.toString()}`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
-  if (!res.ok) {
-    if (res.status === 429) {
-      throw new Error("rate_limit");
-    }
-    throw new Error(`polygonscan_error status=${res.status}`);
+  const result = await safeFetch(url, {
+    provider: "polygonscan",
+    headers: { accept: "application/json" },
+  });
+
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const data = result.data;
+  // Polygonscan returns { status, message, result } — even on "no txs"
+  // status="0" message="No transactions found" result=[] is a VALID empty result
+  if (data?.status === "0" && /no transactions/i.test(data?.message ?? "")) {
+    return {
+      ok: true,
+      activity: [],
+      upstreamProvider: "polygonscan",
+      upstreamStatus: result.status,
+      rawCount: 0,
+      polymarketCount: 0,
+    };
   }
-  const data = (await res.json()) as any;
-  if (data.status === "0" && /Max calls/i.test(data.message ?? "")) {
-    throw new Error("rate_limit");
+  // status="0" with "Max calls" message = rate limit
+  if (data?.status === "0" && /max calls/i.test(data?.message ?? "")) {
+    return {
+      ok: false,
+      error: {
+        code: ErrorCode.UPSTREAM_RATE_LIMITED,
+        message: "polygonscan: rate limit exceeded (Max calls). Set POLYGONSCAN_API_KEY.",
+        retryable: true,
+        upstreamStatus: 200,
+        upstreamProvider: "polygonscan",
+      },
+    };
   }
-  const txs: any[] = Array.isArray(data.result) ? data.result : [];
+
+  const txs: any[] = Array.isArray(data?.result) ? data.result : [];
 
   const ctfLower = ADDRESSES.ctfExchange.toLowerCase();
   const condLower = ADDRESSES.conditionalTokens.toLowerCase();
@@ -335,7 +450,7 @@ export async function getWalletActivity(
       [ctfLower, condLower, negRiskLower].includes(t.to.toLowerCase())
   );
 
-  return filtered.slice(0, limit).map((t) => ({
+  const activity: WalletActivity[] = filtered.slice(0, limit).map((t) => ({
     txHash: t.hash as string,
     timestamp: Number(t.timeStamp) || 0,
     type: classifyTx(t),
@@ -345,6 +460,75 @@ export async function getWalletActivity(
     shares: null,
     price: null,
   }));
+
+  return {
+    ok: true,
+    activity,
+    upstreamProvider: "polygonscan",
+    upstreamStatus: result.status,
+    rawCount: txs.length,
+    polymarketCount: filtered.length,
+  };
+}
+
+/**
+ * Fallback: Polymarket Data API /activity endpoint.
+ *
+ * This endpoint returns the wallet's recent Polymarket trades directly, with
+ * market metadata. Less granular than Polygonscan but more reliable.
+ */
+async function getWalletActivityFromPolymarket(
+  walletAddress: string,
+  limit: number
+): Promise<WalletActivityResult> {
+  const url = `${POLYMARKET_ACTIVITY_BASE}/activity?user=${encodeURIComponent(
+    walletAddress.toLowerCase()
+  )}&limit=${Math.min(limit, 100)}&type=TRADE`;
+
+  const result = await safeFetch(url, {
+    provider: "polymarket-data-api-activity",
+    headers: { accept: "application/json" },
+  });
+
+  if (!result.ok) return { ok: false, error: result.error };
+
+  const data = result.data;
+  if (!Array.isArray(data)) {
+    return {
+      ok: false,
+      error: {
+        code: ErrorCode.UPSTREAM_INVALID_RESPONSE,
+        message: "polymarket-data-api-activity: expected array response",
+        retryable: false,
+        upstreamProvider: "polymarket-data-api-activity",
+        upstreamStatus: result.status,
+      },
+    };
+  }
+
+  const activity: WalletActivity[] = data.slice(0, limit).map((t: any) => ({
+    txHash: t.transactionHash ?? t.txHash ?? "",
+    timestamp: t.timestamp
+      ? Math.floor(new Date(t.timestamp).getTime() / 1000)
+      : t.blockNum
+        ? Number(t.blockNum)
+        : 0,
+    type: t.side === "BUY" ? "buy" : t.side === "SELL" ? "sell" : "other",
+    marketTitle: t.title ?? t.market ?? t.question ?? null,
+    outcome: t.outcome ?? null,
+    amountUsd: t.size ? Number(t.size) * Number(t.price ?? 0) : null,
+    shares: t.size ? Number(t.size) : null,
+    price: t.price ? Number(t.price) : null,
+  }));
+
+  return {
+    ok: true,
+    activity,
+    upstreamProvider: "polymarket-data-api-activity",
+    upstreamStatus: result.status,
+    rawCount: data.length,
+    polymarketCount: data.length,
+  };
 }
 
 function classifyTx(t: any): string {
@@ -354,7 +538,7 @@ function classifyTx(t: any): string {
   const sig = t.input.slice(0, 10).toLowerCase();
   // 0xee0d2c5c = fillOrder (CTF Exchange V1)
   if (sig === "0xee0d2c5c") return "buy";
-  // Common Safe multiSend
+  // 0x8d80ff0a = Safe multiSend — often wraps fillOrder
   if (sig === "0x8d80ff0a") return "multisend";
   return "other";
 }

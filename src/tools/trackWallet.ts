@@ -1,10 +1,12 @@
 /**
  * tools/trackWallet.ts
  *
- * Add or remove a wallet from the user's watchlist.
+ * Manage the wallet watchlist (Kreopoly's wallet-tracker feature).
  *
- * The watchlist is per-PayBox-user, stored locally. Used together with
- * kreopoly_get_tracked_activity to mirror Kreopoly's wallet-tracker feature.
+ * READ + WRITE (local storage only) — does NOT touch the blockchain, does
+ * NOT sign anything, does NOT require any wallet permission. The watchlist
+ * is a local JSON file used only by this plugin to remember which wallets
+ * the user wants to monitor.
  */
 
 import { z } from "zod";
@@ -14,6 +16,7 @@ import {
   listWallets,
   type TrackedWallet,
 } from "../lib/store.js";
+import { makeError, ErrorCode } from "../lib/errors.js";
 
 const addAction = z.object({
   action: z.literal("add").describe("Add a wallet to the watchlist."),
@@ -51,34 +54,50 @@ export type TrackWalletArgs = z.infer<typeof trackWalletSchema>;
 export const trackWalletTool = {
   name: "kreopoly_track_wallet",
   description:
+    "[READ + LOCAL WRITE] [NO BLOCKCHAIN] [NO SIGNATURE] [NO FUND MOVEMENT] " +
     "Manage the wallet watchlist (Kreopoly's wallet-tracker feature). " +
-    "Actions: add, remove, list. Tracked wallets can be queried with " +
-    "kreopoly_get_tracked_activity to mirror smart-money moves. Free read.",
+    "Actions: add, remove, list. The watchlist is a local JSON file — no " +
+    "blockchain interaction, no wallet permission required. Tracked wallets " +
+    "can be queried with kreopoly_get_tracked_activity to surface smart-money moves.",
   inputSchema: trackWalletSchema,
   handler: async (args: TrackWalletArgs, ctx: { userId: string }) => {
     const userId = ctx.userId || "anonymous";
 
     if (args.action === "add") {
-      const entry: TrackedWallet = await addWallet(
-        userId,
-        args.walletAddress,
-        args.label
-      );
+      const result = await addWallet(userId, args.walletAddress, args.label);
+
+      if (!result.ok) {
+        // Persistence failed — return explicit error, do NOT claim success
+        return makeError(
+          ErrorCode.WATCHLIST_PERSISTENCE_FAILED,
+          result.error ?? "Watchlist persistence failed for unknown reason.",
+          { retryable: true }
+        );
+      }
+
       return {
         ok: true,
         action: "added",
-        wallet: entry,
-        message: `Now tracking ${entry.address}${entry.label ? ` (${entry.label})` : ""}. ` +
-          `Call kreopoly_get_tracked_activity to fetch recent trades.`,
+        wallet: result.wallet,
+        message: `Now tracking ${result.wallet!.address}${
+          result.wallet!.label ? ` (${result.wallet!.label})` : ""
+        }. Call kreopoly_get_tracked_activity to fetch recent trades.`,
       };
     }
 
     if (args.action === "remove") {
-      const removed = await removeWallet(userId, args.walletAddress);
+      const result = await removeWallet(userId, args.walletAddress);
+      if (!result.ok) {
+        return makeError(
+          ErrorCode.WATCHLIST_PERSISTENCE_FAILED,
+          result.error ?? "Watchlist persistence failed during remove.",
+          { retryable: true }
+        );
+      }
       return {
-        ok: removed,
+        ok: true,
         action: "removed",
-        message: removed
+        message: result.removed
           ? `Stopped tracking ${args.walletAddress}.`
           : `Wallet ${args.walletAddress} was not in the watchlist.`,
       };

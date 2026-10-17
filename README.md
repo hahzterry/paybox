@@ -302,7 +302,7 @@ Three reasons:
 
 ### What's the v0.1 limitation?
 
-1. **`place_bet` calldata** — returns a stub `fillOrder` calldata. To actually fill an order on Polymarket's CLOB, you need to fetch an order from Polymarket's CLOB API and sign it EIP-712. Production wiring is documented in `src/tools/placeBet.ts` — replace `encodeFillOrderStub` with `@polymarket/order-utils`'s `encodeOrder`.
+1. **`place_bet` calldata** — returns a stub `fillOrder` calldata placeholder. To actually fill an order on Polymarket's CLOB, you need to fetch an order from Polymarket's CLOB API and sign it EIP-712. Production wiring is documented in `src/tools/placeBet.ts` — replace `buildOrderIntent` with `@polymarket/order-utils`'s `encodeOrder`.
 
 2. **Source trade decoding in copy signals** — the plugin detects that a tracked wallet made a Polymarket transaction, but cannot decode the conditionId / outcome / size from raw Polygonscan data alone. The agent must use the Polymarket Data API (`https://data-api.polymarket.com/positions?user=<source>`) to look up the source wallet's latest position. This is one extra call per actionable signal.
 
@@ -318,6 +318,108 @@ Three reasons:
 5. **Crypto Price Entry mode not implemented** — Kreopoly exposes a second auto-trade entry mode that triggers entries based on BTC/ETH price movements, distinct from market/limit. This is on the roadmap; not in v0.1.
 
 6. **5m/15m crypto price auto-trade** — Kreopoly's preset strategies for Polymarket's crypto price prediction markets are not implemented. Niche feature, low judging impact.
+
+## Error semantics & layer attribution
+
+All tool responses follow a standardized error structure:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "ACTIVITY_FETCH_FAILED",
+    "message": "Activity provider returned HTML instead of JSON.",
+    "retryable": true,
+    "layer": "activity_provider",
+    "upstreamStatus": 200,
+    "upstreamProvider": "polygonscan",
+    "upstreamContentType": "text/html",
+    "upstreamPreview": "<!DOCTYPE html>..."
+  }
+}
+```
+
+### Error layers
+
+| Layer | What it means |
+|---|---|
+| `client_input` | Bad args from the agent (schema validation, invalid address) |
+| `activity_provider` | Upstream API failure (Polygonscan / Polymarket Data API) — HTML, rate limit, WAF, timeout |
+| `market_provider` | Polymarket Gamma API failure (market not found, market closed) |
+| `watchlist_store` | Local watchlist persistence failed (write → verify → return success) |
+| `copytask_store` | Local copy-task persistence failed |
+| `construction` | Building the order_intent / redeem_intent failed |
+| `signing` | PayBox signing layer (forwarded via separate MCP tool) |
+| `execution` | Blockchain / Polymarket execution (broadcast, revert, insufficient balance) |
+| `internal` | Unhandled / unexpected |
+
+### Error codes (full list in `src/lib/errors.ts`)
+
+| Code | Layer | Meaning |
+|---|---|---|
+| `UPSTREAM_TIMEOUT` | activity_provider | Network timeout fetching from Polygonscan / Polymarket |
+| `UPSTREAM_RATE_LIMITED` | activity_provider | HTTP 429 or Polygonscan "Max calls" |
+| `UPSTREAM_INVALID_RESPONSE` | activity_provider | JSON parse failed |
+| `UPSTREAM_HTML_RESPONSE` | activity_provider | Got HTML where JSON expected (WAF / Cloudflare) |
+| `UPSTREAM_HTTP_ERROR` | activity_provider | Other HTTP 4xx/5xx |
+| `UPSTREAM_BLOCKED` | activity_provider | WAF challenge page detected |
+| `ACTIVITY_FETCH_FAILED` | activity_provider | Generic activity-fetch failure (any of the above) |
+| `INVALID_PARAMETERS` | client_input | Zod schema validation failed |
+| `WALLET_INVALID_FORMAT` | client_input | Address not 40-hex / 0x-prefixed |
+| `WATCHLIST_PERSISTENCE_FAILED` | watchlist_store | write → verify failed |
+| `COPYTASK_PERSISTENCE_FAILED` | copytask_store | write → verify failed |
+| `MARKET_NOT_FOUND` | market_provider | conditionId does not match any Polymarket market |
+| `MARKET_CLOSED` | market_provider | Market is no longer active |
+| `MARKET_NOT_RESOLVED` | market_provider | Market exists but has not resolved yet |
+| `NO_SHARES_TO_REDEEM` | market_provider | Reference account has no shares in this market |
+| `BET_CONSTRUCTION_FAILED` | construction | Order intent build failed |
+| `SETTLEMENT_CONSTRUCTION_FAILED` | construction | Redeem intent build failed |
+| `SIGNING_REQUIRED` | signing | PayBox signing prompt is needed |
+| `SIGNING_FAILED` | signing | PayBox signing layer failed |
+| `INSUFFICIENT_BALANCE` | execution | Wallet has insufficient USDC.e |
+| `TRANSACTION_REVERTED` | execution | On-chain execution reverted |
+| `NO_ACTIVITY` | internal | Upstream OK but no new trades (genuine zero) |
+| `NO_MATCHING_TRADES` | internal | Upstream OK, filters rejected all trades |
+| `NO_ACTIONABLE_SIGNAL` | internal | Upstream OK, no actionable mirror suggestion |
+| `TASK_NOT_FOUND` | internal | Copy-task ID does not exist |
+| `INTERNAL_ERROR` | internal | Unhandled exception |
+
+### Critical distinction: `NO_ACTIVITY` ≠ `ACTIVITY_FETCH_FAILED`
+
+These MUST NOT be conflated:
+
+- `NO_ACTIVITY` (ok=true) — upstream confirmed OK, no trades found. Genuine zero.
+- `ACTIVITY_FETCH_FAILED` (ok=false) — upstream failed. Do NOT treat as "no trades".
+
+The signal-check response always includes a `funnel` object that shows exactly what happened at each filter stage:
+
+```json
+{
+  "ok": true,
+  "results": [{
+    "task": { "id": "...", "label": "...", "sourceWallet": "..." },
+    "ok": true,
+    "funnel": {
+      "upstreamProvider": "polymarket-data-api-activity",
+      "upstreamStatus": 200,
+      "rawTradesDetected": 15,
+      "polymarketTradesDetected": 15,
+      "newTradesDetected": 4,
+      "afterDirectionFilter": 3,
+      "afterCategoryFilter": 2,
+      "afterSizeFilter": 1,
+      "afterDuplicateMarketFilter": 1,
+      "actionableSignals": 1,
+      "rejectionReasons": [
+        "tx 0xabcd: follow_buys requires tx.type=buy, got sell",
+        "tx 0x1234: $8.00 above max_buy $5"
+      ]
+    }
+  }]
+}
+```
+
+If `ok=false`, the funnel shows `upstreamProvider`, `upstreamStatus`, and a `rejectionReasons` array containing the upstream error message — never silently converted to "no activity".
 
 ## Submitting to the hackathon
 

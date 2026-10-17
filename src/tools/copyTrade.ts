@@ -29,6 +29,8 @@ import {
   type TradeDirection,
   type EntryMode,
 } from "../lib/copyTasks.js";
+import { normalizeCopyTradeArgs, formatZodError } from "../lib/schemaNormalize.js";
+import { makeError, ErrorCode } from "../lib/errors.js";
 
 // ---------------------------------------------------------------------------
 // Action: create
@@ -174,13 +176,16 @@ export type CopyTradeArgs = z.infer<typeof copyTradeSchema>;
 export const copyTradeTool = {
   name: "kreopoly_copy_trade",
   description:
+    "[READ + LOCAL WRITE] [NO BLOCKCHAIN] [NO SIGNATURE] [NO FUND MOVEMENT] " +
     "Manage copy-trade tasks (Kreopoly's headline feature). Actions: " +
     "create (set up a new copy task with sizing, filters, direction, SL/TP, entry mode), " +
     "list (show all tasks), pause (stop copying), resume (restart), delete, update. " +
     "Does NOT execute mirror trades — use kreopoly_check_copy_signals to discover " +
     "pending mirrors, then kreopoly_place_bet to execute (returns a signing_request " +
     "for PayBox). The user must confirm task creation and approve each mirror trade " +
-    "through PayBox's standard signing flow.",
+    "through PayBox's standard signing flow. " +
+    "Aliases accepted: walletAddress/address/userWalletAddress → sourceWallet; " +
+    "sizing.mode → sizing.method; sizing.amountUsd/sizing.amount → sizing.fixedUsd.",
   inputSchema: copyTradeSchema,
   handler: async (args: CopyTradeArgs, ctx: { userId: string }) => {
     const userId = ctx.userId || "anonymous";
@@ -213,21 +218,29 @@ export const copyTradeTool = {
           limitExpiresAt: args.limitExpiresAt,
           enabled: args.enabled,
         };
-        const task = await createTask(userId, input);
-        return {
-          ok: true,
-          action: "created",
-          task: summarizeTask(task),
-          message:
-            `Copy task created${task.enabled ? " and ACTIVE" : " (staged — call action='resume' to start)"}. ` +
-            `Source: ${task.sourceWallet}. ` +
-            `The agent should now periodically call kreopoly_check_copy_signals to detect new trades. ` +
-            `When a signal is actionable, call kreopoly_place_bet with the suggested mirror trade. ` +
-            `Tell the user: "Now copying ${task.label}. Say 'stop' to pause."`,
-          next_step:
-            "Periodically call kreopoly_check_copy_signals for this task. " +
-            "On actionable signals, present the cost to the user and call kreopoly_place_bet.",
-        };
+        try {
+          const task = await createTask(userId, input);
+          return {
+            ok: true,
+            action: "created",
+            task: summarizeTask(task),
+            message:
+              `Copy task created${task.enabled ? " and ACTIVE" : " (staged — call action='resume' to start)"}. ` +
+              `Source: ${task.sourceWallet}. ` +
+              `The agent should now periodically call kreopoly_check_copy_signals to detect new trades. ` +
+              `When a signal is actionable, call kreopoly_place_bet with the suggested mirror trade. ` +
+              `Tell the user: "Now copying ${task.label}. Say 'stop' to pause."`,
+            next_step:
+              "Periodically call kreopoly_check_copy_signals for this task. " +
+              "On actionable signals, present the cost to the user and call kreopoly_place_bet.",
+          };
+        } catch (err: any) {
+          return makeError(
+            ErrorCode.INVALID_PARAMETERS,
+            err.message ?? "Failed to create copy task.",
+            { retryable: false }
+          );
+        }
       }
 
       case "list": {
@@ -242,33 +255,54 @@ export const copyTradeTool = {
       }
 
       case "pause": {
-        const task = await setEnabled(userId, args.taskId, false);
-        return {
-          ok: true,
-          action: "paused",
-          task: summarizeTask(task),
-          message: `Copy task "${task.label}" paused. No new mirror trades will be suggested. Call action='resume' to restart.`,
-        };
+        try {
+          const task = await setEnabled(userId, args.taskId, false);
+          return {
+            ok: true,
+            action: "paused",
+            task: summarizeTask(task),
+            message: `Copy task "${task.label}" paused. No new mirror trades will be suggested. Call action='resume' to restart.`,
+          };
+        } catch (err: any) {
+          return makeError(
+            ErrorCode.TASK_NOT_FOUND,
+            err.message ?? `Task ${args.taskId} not found.`,
+            { retryable: false }
+          );
+        }
       }
 
       case "resume": {
-        const task = await setEnabled(userId, args.taskId, true);
-        return {
-          ok: true,
-          action: "resumed",
-          task: summarizeTask(task),
-          message: `Copy task "${task.label}" resumed. Agent will suggest mirror trades on new source-wallet activity.`,
-        };
+        try {
+          const task = await setEnabled(userId, args.taskId, true);
+          return {
+            ok: true,
+            action: "resumed",
+            task: summarizeTask(task),
+            message: `Copy task "${task.label}" resumed. Agent will suggest mirror trades on new source-wallet activity.`,
+          };
+        } catch (err: any) {
+          return makeError(
+            ErrorCode.TASK_NOT_FOUND,
+            err.message ?? `Task ${args.taskId} not found.`,
+            { retryable: false }
+          );
+        }
       }
 
       case "delete": {
         const deleted = await deleteTask(userId, args.taskId);
+        if (!deleted) {
+          return makeError(
+            ErrorCode.TASK_NOT_FOUND,
+            `Task ${args.taskId} not found.`,
+            { retryable: false }
+          );
+        }
         return {
-          ok: deleted,
+          ok: true,
           action: "deleted",
-          message: deleted
-            ? `Task ${args.taskId} deleted.`
-            : `Task ${args.taskId} not found.`,
+          message: `Task ${args.taskId} deleted.`,
         };
       }
 
@@ -300,12 +334,20 @@ export const copyTradeTool = {
         if (args.limitMaxPrice !== undefined) patch.limitMaxPrice = args.limitMaxPrice;
         if (args.limitExpiresAt !== undefined) patch.limitExpiresAt = args.limitExpiresAt;
 
-        const task = await updateTask(userId, args.taskId, patch);
-        return {
-          ok: true,
-          action: "updated",
-          task: summarizeTask(task),
-        };
+        try {
+          const task = await updateTask(userId, args.taskId, patch);
+          return {
+            ok: true,
+            action: "updated",
+            task: summarizeTask(task),
+          };
+        } catch (err: any) {
+          return makeError(
+            ErrorCode.TASK_NOT_FOUND,
+            err.message ?? `Task ${args.taskId} not found.`,
+            { retryable: false }
+          );
+        }
       }
     }
   },
