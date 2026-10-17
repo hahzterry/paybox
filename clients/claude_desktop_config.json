@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kreopoly-lens": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/paybox-kreopoly-lens/dist/index.js"],
+      "env": {
+        "POLYGON_RPC_URL": "https://polygon-rpc.com",
+        "POLYGONSCAN_API_KEY": "YOUR_POLYGONSCAN_API_KEY",
+        "WATCHLIST_PATH": "/ABSOLUTE/PATH/TO/paybox-kreopoly-lens/.data/watchlist.json",
+        "COPYTASKS_PATH": "/ABSOLUTE/PATH/TO/paybox-kreopoly-lens/.data/copytasks.json"
+      }
+    }
+  }
+}

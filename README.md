@@ -65,6 +65,24 @@ The plugin **never** sees the private key. `kreopoly_place_bet` returns a `signi
 
 ## Quickstart
 
+The plugin supports **two transports**:
+
+| Transport | Use case | Entry point |
+|---|---|---|
+| **stdio** | Claude Desktop, PayBox Desktop, any MCP host that spawns a child process | `node dist/index.js` |
+| **HTTP** (Streamable HTTP) | ChatGPT (Custom Connectors / Developer Mode), remote MCP clients, Render/Railway deployment | `node dist/http.js --port=3000` |
+
+Both expose the same 8 tools — pick the one your AI client supports.
+
+### Client setup guides
+
+Step-by-step instructions for each AI client:
+
+- **[clients/CLAUDE_DESKTOP.md](./clients/CLAUDE_DESKTOP.md)** — Claude Desktop config (stdio)
+- **[clients/CHATGPT.md](./clients/CHATGPT.md)** — ChatGPT setup with ngrok or Render (HTTP)
+- **[clients/claude_desktop_config.json](./clients/claude_desktop_config.json)** — ready-to-edit config file for Claude Desktop
+- **[render.yaml](./render.yaml)** — one-click deploy to Render for permanent ChatGPT-compatible hosting
+
 ### 1. Install
 
 ```bash
