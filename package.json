@@ -1,0 +1,39 @@
+{
+  "name": "paybox-kreopoly-lens",
+  "version": "0.1.0",
+  "description": "PayBox marketplace plugin: on-chain Polymarket intelligence + trade execution for AI agents. Inspired by Kreopoly's Telegram bot.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "paybox-kreopoly-lens": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ethers": "^6.13.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "paybox",
+    "moonpay",
+    "mcp",
+    "polymarket",
+    "prediction-markets",
+    "ai-agents",
+    "x402"
+  ]
+}

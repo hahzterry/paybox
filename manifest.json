@@ -1,0 +1,36 @@
+{
+  "name": "paybox-kreopoly-lens",
+  "displayName": "Kreopoly Lens",
+  "description": "On-chain Polymarket intelligence + trade execution for AI agents. Track wallets, read positions, and place bets through PayBox's non-custodial signing layer.",
+  "version": "0.1.0",
+  "logo": "assets/logo.svg",
+  "category": "predictions",
+  "homepage": "https://github.com/your-org/paybox-kreopoly-lens",
+  "author": {
+    "name": "Your Name",
+    "url": "https://github.com/your-org"
+  },
+  "license": "MIT",
+  "capabilities": [
+    "read_positions",
+    "wallet_tracking",
+    "market_intelligence",
+    "execute_trades",
+    "copy_trading",
+    "settle_positions",
+    "category_filters"
+  ],
+  "requires_credentials": [
+    {
+      "kind": "wallet",
+      "chains": ["polygon"],
+      "scopes": ["sign_transaction"],
+      "approval_mode": "autonomous",
+      "description": "Polygon wallet used to read positions and (optionally) sign Polymarket CTF Exchange trades."
+    }
+  ],
+  "cost_model": {
+    "per_request_usd": 0,
+    "notes": "Reads are free (Polygon RPC). Trade execution uses PayBox's native request_wallet_sign and may incur gas + Polymarket fees."
+  }
+}

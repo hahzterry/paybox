@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kreopoly-lens": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "POLYGON_RPC_URL": "https://polygon-rpc.com",
+        "POLYGONSCAN_API_KEY": "${POLYGONSCAN_API_KEY}",
+        "WATCHLIST_PATH": "${WATCHLIST_PATH:-./.data/watchlist.json}"
+      }
+    }
+  }
+}
