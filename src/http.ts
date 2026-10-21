@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * src/http.ts — Kreopoly Lens HTTP MCP Server (raw JSON-RPC)
+ * src/http.ts — Kreopoly Lens HTTP MCP Server
  *
- * Simple HTTP server that handles MCP JSON-RPC over HTTP.
- * No SDK HTTP transport dependency — just raw request/response.
+ * Handles MCP JSON-RPC over HTTP with proper session management
+ * and JSON Schema conversion for tool schemas.
  *
  * ChatGPT connects to https://your-app.onrender.com/mcp
  */
 
 import http from "node:http";
-// @ts-ignore — import from server.ts which exports createServer
+import { randomUUID } from "node:crypto";
 import { createServer } from "./server.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
@@ -17,8 +17,181 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10);
 // Create the MCP server instance
 const mcpServer = createServer();
 
-// Store connected sessions (simple in-memory)
-let initialized = false;
+// Session management
+let sessionInitialized = false;
+let sessionId: string | null = null;
+
+// Extract tool definitions and convert Zod schemas to JSON Schema
+function getToolList() {
+  const tools = (mcpServer as any)._registeredTools ?? {};
+  const toolList = [];
+  for (const [name, def] of Object.entries(tools)) {
+    const d = def as any;
+    // Convert Zod schema to JSON Schema if needed
+    let inputSchema = d.inputSchema;
+    // If it's a Zod schema (has _def), convert it
+    if (inputSchema && inputSchema._def) {
+      inputSchema = zodToJsonSchema(inputSchema);
+    }
+    // If inputSchema is missing or not a plain object, default to empty
+    if (!inputSchema || typeof inputSchema !== 'object' || inputSchema._def) {
+      inputSchema = { type: "object", properties: {}, additionalProperties: true };
+    }
+    toolList.push({
+      name,
+      description: d.description ?? "",
+      inputSchema,
+    });
+  }
+  return toolList;
+}
+
+// Minimal Zod-to-JSON-Schema converter
+function zodToJsonSchema(schema: any): any {
+  if (!schema || !schema._def) return schema;
+
+  const def = schema._def;
+  const typeName = def.typeName || def.constructor?.name || '';
+
+  // ZodObject
+  if (def.shape) {
+    const shape = typeof def.shape === 'function' ? def.shape() : def.shape;
+    const properties: any = {};
+    const required: string[] = [];
+    for (const [key, value] of Object.entries(shape)) {
+      properties[key] = zodToJsonSchema(value);
+      // Check if required (not optional)
+      const vDef = (value as any)?._def;
+      if (vDef && vDef.typeName !== 'ZodOptional' && vDef.typeName !== 'ZodDefault') {
+        required.push(key);
+      }
+    }
+    const result: any = { type: "object", properties };
+    if (required.length > 0) result.required = required;
+    // Check for strict/passthrough
+    if (def.catchall && def.catchall._def) {
+      const ca = def.catchall._def;
+      if (ca.typeName === 'ZodNever' || (ca.typeName === 'ZodLiteral' && ca.value === undefined)) {
+        result.additionalProperties = false;
+      } else {
+        result.additionalProperties = true;
+      }
+    } else {
+      result.additionalProperties = true;
+    }
+    return result;
+  }
+
+  // ZodString
+  if (typeName === 'ZodString' || def.checks !== undefined) {
+    const result: any = { type: "string" };
+    if (def.checks) {
+      for (const check of def.checks) {
+        if (check.kind === 'regex') result.pattern = check.regex?.source;
+        if (check.kind === 'min') result.minLength = check.value;
+        if (check.kind === 'max') result.maxLength = check.value;
+      }
+    }
+    return result;
+  }
+
+  // ZodNumber
+  if (typeName === 'ZodNumber') {
+    const result: any = { type: "number" };
+    if (def.checks) {
+      for (const check of def.checks) {
+        if (check.kind === 'min') result.minimum = check.value;
+        if (check.kind === 'max') result.maximum = check.value;
+        if (check.kind === 'int') result.type = "integer";
+      }
+    }
+    return result;
+  }
+
+  // ZodBoolean
+  if (typeName === 'ZodBoolean') return { type: "boolean" };
+
+  // ZodEnum / ZodLiteral
+  if (typeName === 'ZodEnum') return { type: "string", enum: def.values };
+  if (typeName === 'ZodLiteral') return { const: def.value };
+
+  // ZodArray
+  if (typeName === 'ZodArray') return { type: "array", items: zodToJsonSchema(def.element) };
+
+  // ZodOptional
+  if (typeName === 'ZodOptional') return zodToJsonSchema(def.innerType);
+
+  // ZodDefault
+  if (typeName === 'ZodDefault') {
+    const s = zodToJsonSchema(def.innerType);
+    return { ...s, default: def.defaultValue };
+  }
+
+  // ZodDiscriminatedUnion
+  if (typeName === 'ZodDiscriminatedUnion' || (def.options && def.discriminator !== undefined)) {
+    const options = def.options || [];
+    if (Array.isArray(options)) {
+      // Try to merge into a single schema with oneOf
+      const schemas = options.map((o: any) => zodToJsonSchema(o));
+      // If all are objects, merge properties
+      if (schemas.every((s: any) => s.type === 'object' && s.properties)) {
+        const allProps: any = {};
+        for (const s of schemas) {
+          Object.assign(allProps, s.properties);
+        }
+        return {
+          type: 'object',
+          properties: allProps,
+          oneOf: schemas,
+          additionalProperties: true,
+        };
+      }
+      return { oneOf: schemas };
+    }
+    return { oneOf: options.map((o: any) => zodToJsonSchema(o)) };
+  }
+
+  // ZodUnion
+  if (typeName === 'ZodUnion' || (def.options && def.discriminator === undefined)) {
+    const options = def.options || [];
+    if (Array.isArray(options)) {
+      return { anyOf: options.map((o: any) => zodToJsonSchema(o)) };
+    }
+    return { anyOf: [] };
+  }
+
+  // Fallback
+  return { type: "object", properties: {}, additionalProperties: true };
+}
+
+// Parse tool arguments, applying defaults
+function parseToolArgs(toolDef: any, args: any): any {
+  const schema = toolDef?.inputSchema;
+  if (!schema || !schema._def) return args;
+
+  const shape = schema._def.shape;
+  if (!shape) return args;
+
+  const shapeObj = typeof shape === 'function' ? shape() : shape;
+  const result = { ...args };
+
+  for (const [key, value] of Object.entries(shapeObj)) {
+    const v = value as any;
+    const vDef = v?._def;
+
+    // Apply defaults
+    if (vDef?.typeName === 'ZodDefault' && result[key] === undefined) {
+      result[key] = vDef.defaultValue;
+    }
+
+    // Unwrap optional
+    if (vDef?.typeName === 'ZodOptional' && result[key] !== undefined) {
+      // Value is present — validate the inner type
+    }
+  }
+
+  return result;
+}
 
 const httpServer = http.createServer(async (req, res) => {
   // CORS
@@ -49,7 +222,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // MCP endpoint — handle POST with JSON-RPC
+  // MCP endpoint
   if (url.pathname === "/mcp" && req.method === "POST") {
     const body = await readBody(req);
     let msg: any;
@@ -61,76 +234,39 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
-    // Handle the JSON-RPC message using the MCP server
-    // The MCP SDK v2 Server has a built-in request handler
-    // We need to use the internal transport mechanism
-    // Simplest: use InMemoryTransport to connect and forward
-
-    // Actually, let's use a simpler approach — directly handle the common methods
     const method = msg.method;
     const id = msg.id;
     const params = msg.params ?? {};
 
     try {
-      // Add _meta for protocol version
-      const enrichedParams = {
-        ...params,
-        _meta: params._meta ?? {
-          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-          "io.modelcontextprotocol/clientInfo": { name: "http-client", version: "1.0" },
-          "io.modelcontextprotocol/clientCapabilities": {},
-        },
-      };
-
-      // Use the server's internal request handling
-      // The MCP SDK v2 Server can handle requests via setRequestHandler
-      // but we need to invoke it directly. Let's use a different approach.
-
-      // Since createServer() returns a McpServer that's already configured with
-      // request handlers, we can send JSON-RPC messages through its internal
-      // transport. Let's use InMemoryTransport for this.
-
-      // Actually, the simplest approach: the McpServer extends Server which
-      // has a _requestHandler map. We can call server.handleRequest() directly.
-      // But that's internal API.
-
-      // Let's just use a raw approach — handle the 3 methods we need:
-      // tools/list, tools/call, initialize
-
+      // initialize
       if (method === "initialize") {
+        sessionId = randomUUID();
+        sessionInitialized = true;
+        res.setHeader("Mcp-Session-Id", sessionId);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           jsonrpc: "2.0",
           id,
           result: {
-            protocolVersion: "2026-07-28",
-            capabilities: { tools: {} },
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: { listChanged: false } },
             serverInfo: { name: "kreopoly-lens", version: "0.5.0" },
           },
         }));
-        initialized = true;
         return;
       }
 
+      // notifications/initialized
       if (method === "notifications/initialized") {
         res.writeHead(200);
         res.end();
         return;
       }
 
+      // tools/list
       if (method === "tools/list") {
-        // Get tools from the server's registered tools registry
-        const tools = (mcpServer as any)._registeredTools ?? {};
-        const toolList = [];
-        for (const [name, def] of Object.entries(tools)) {
-          const d = def as any;
-          toolList.push({
-            name,
-            description: d.description,
-            inputSchema: d.inputSchema ?? d.schema ?? { type: "object", properties: {} },
-          });
-        }
-
+        const toolList = getToolList();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           jsonrpc: "2.0",
@@ -140,11 +276,11 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
+      // tools/call
       if (method === "tools/call") {
         const toolName = params.name;
         const toolArgs = params.arguments ?? {};
 
-        // Find the tool and call it
         const tools = (mcpServer as any)._registeredTools ?? {};
         const toolDef = tools[toolName] as any;
 
@@ -162,17 +298,27 @@ const httpServer = http.createServer(async (req, res) => {
         }
 
         try {
-          // Call the tool handler — the handler is in toolDef.handler or toolDef.callback
+          // Apply defaults to args
+          const parsedArgs = parseToolArgs(toolDef, toolArgs);
+
+          // Call the handler
           const handler = toolDef.handler ?? toolDef.callback ?? toolDef.fn;
-          if (!handler) {
-            throw new Error(`Tool ${toolName} has no handler`);
-          }
-          const result = await handler(toolArgs, { userId: "anonymous" });
+          if (!handler) throw new Error(`Tool ${toolName} has no handler`);
+
+          const result = await handler(parsedArgs, { userId: "anonymous" });
+
+          // Ensure result is JSON-safe
+          const safeResult = JSON.parse(JSON.stringify(result, (key, value) => {
+            if (typeof value === 'bigint') return value.toString();
+            if (value === undefined) return null;
+            return value;
+          }));
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
             id,
-            result,
+            result: safeResult,
           }));
         } catch (err: any) {
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -185,6 +331,13 @@ const httpServer = http.createServer(async (req, res) => {
             },
           }));
         }
+        return;
+      }
+
+      // ping
+      if (method === "ping") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id, result: {} }));
         return;
       }
 
