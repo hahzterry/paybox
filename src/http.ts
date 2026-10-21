@@ -46,12 +46,16 @@ function getToolList() {
   return toolList;
 }
 
-// Minimal Zod-to-JSON-Schema converter
+// Minimal Zod-to-JSON-Schema converter (Zod v4 compatible)
 function zodToJsonSchema(schema: any): any {
-  if (!schema || !schema._def) return schema;
+  if (!schema || !schema._def) {
+    if (typeof schema === 'object' && schema !== null && !Array.isArray(schema)) return schema;
+    return { type: "object", properties: {}, additionalProperties: true };
+  }
 
   const def = schema._def;
-  const typeName = def.typeName || def.constructor?.name || '';
+  const type = def.type || '';
+  const ctorName = schema?.constructor?.name || '';
 
   // ZodObject
   if (def.shape) {
@@ -59,31 +63,26 @@ function zodToJsonSchema(schema: any): any {
     const properties: any = {};
     const required: string[] = [];
     for (const [key, value] of Object.entries(shape)) {
-      properties[key] = zodToJsonSchema(value);
-      // Check if required (not optional)
-      const vDef = (value as any)?._def;
-      if (vDef && vDef.typeName !== 'ZodOptional' && vDef.typeName !== 'ZodDefault') {
+      const v = value as any;
+      const vDef = v?._def || {};
+      const vType = vDef.type || '';
+      const vCtor = v?.constructor?.name || '';
+
+      properties[key] = zodToJsonSchema(v);
+
+      // Required only if NOT optional and NOT default
+      if (vType !== 'optional' && vType !== 'default' && vCtor !== 'ZodOptional' && vCtor !== 'ZodDefault') {
         required.push(key);
       }
     }
     const result: any = { type: "object", properties };
     if (required.length > 0) result.required = required;
-    // Check for strict/passthrough
-    if (def.catchall && def.catchall._def) {
-      const ca = def.catchall._def;
-      if (ca.typeName === 'ZodNever' || (ca.typeName === 'ZodLiteral' && ca.value === undefined)) {
-        result.additionalProperties = false;
-      } else {
-        result.additionalProperties = true;
-      }
-    } else {
-      result.additionalProperties = true;
-    }
+    result.additionalProperties = true;
     return result;
   }
 
   // ZodString
-  if (typeName === 'ZodString' || def.checks !== undefined) {
+  if (ctorName === 'ZodString' || type === 'string') {
     const result: any = { type: "string" };
     if (def.checks) {
       for (const check of def.checks) {
@@ -96,7 +95,7 @@ function zodToJsonSchema(schema: any): any {
   }
 
   // ZodNumber
-  if (typeName === 'ZodNumber') {
+  if (ctorName === 'ZodNumber' || type === 'number') {
     const result: any = { type: "number" };
     if (def.checks) {
       for (const check of def.checks) {
@@ -109,58 +108,48 @@ function zodToJsonSchema(schema: any): any {
   }
 
   // ZodBoolean
-  if (typeName === 'ZodBoolean') return { type: "boolean" };
+  if (ctorName === 'ZodBoolean' || type === 'boolean') return { type: "boolean" };
 
-  // ZodEnum / ZodLiteral
-  if (typeName === 'ZodEnum') return { type: "string", enum: def.values };
-  if (typeName === 'ZodLiteral') return { const: def.value };
+  // ZodEnum
+  if (ctorName === 'ZodEnum' || type === 'enum') return { type: "string", enum: def.values ?? [] };
+
+  // ZodLiteral
+  if (ctorName === 'ZodLiteral' || type === 'literal') return { const: def.value };
 
   // ZodArray
-  if (typeName === 'ZodArray') return { type: "array", items: zodToJsonSchema(def.element) };
+  if (ctorName === 'ZodArray' || type === 'array') return { type: "array", items: zodToJsonSchema(def.element) };
 
-  // ZodOptional
-  if (typeName === 'ZodOptional') return zodToJsonSchema(def.innerType);
+  // ZodOptional — unwrap
+  if (ctorName === 'ZodOptional' || type === 'optional') return zodToJsonSchema(def.innerType);
 
-  // ZodDefault
-  if (typeName === 'ZodDefault') {
+  // ZodDefault — unwrap with default
+  if (ctorName === 'ZodDefault' || type === 'default') {
     const s = zodToJsonSchema(def.innerType);
     return { ...s, default: def.defaultValue };
   }
 
   // ZodDiscriminatedUnion
-  if (typeName === 'ZodDiscriminatedUnion' || (def.options && def.discriminator !== undefined)) {
+  if (ctorName === 'ZodDiscriminatedUnion' || (def.options && def.discriminator !== undefined)) {
     const options = def.options || [];
     if (Array.isArray(options)) {
-      // Try to merge into a single schema with oneOf
       const schemas = options.map((o: any) => zodToJsonSchema(o));
-      // If all are objects, merge properties
       if (schemas.every((s: any) => s.type === 'object' && s.properties)) {
         const allProps: any = {};
-        for (const s of schemas) {
-          Object.assign(allProps, s.properties);
-        }
-        return {
-          type: 'object',
-          properties: allProps,
-          oneOf: schemas,
-          additionalProperties: true,
-        };
+        for (const s of schemas) Object.assign(allProps, s.properties);
+        return { type: 'object', properties: allProps, additionalProperties: true };
       }
       return { oneOf: schemas };
     }
-    return { oneOf: options.map((o: any) => zodToJsonSchema(o)) };
+    return { type: 'object', properties: {}, additionalProperties: true };
   }
 
   // ZodUnion
-  if (typeName === 'ZodUnion' || (def.options && def.discriminator === undefined)) {
+  if (ctorName === 'ZodUnion' || (type === 'union' && !def.discriminator)) {
     const options = def.options || [];
-    if (Array.isArray(options)) {
-      return { anyOf: options.map((o: any) => zodToJsonSchema(o)) };
-    }
-    return { anyOf: [] };
+    if (Array.isArray(options)) return { anyOf: options.map((o: any) => zodToJsonSchema(o)) };
+    return { type: 'object', properties: {}, additionalProperties: true };
   }
 
-  // Fallback
   return { type: "object", properties: {}, additionalProperties: true };
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
-import { createServer } from "./server";
+import { createServer } from "./serve";
 
 async function main() {
   const server = createServer();
