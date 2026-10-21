@@ -1,14 +1,3 @@
-# Render Blueprint — deploys paybox-kreopoly-lens as an HTTP MCP server
-# for ChatGPT / remote MCP clients.
-#
-# Usage:
-#   1. Push this repo to GitHub
-#   2. Go to https://render.com → New → Blueprint
-#   3. Connect your GitHub repo
-#   4. Render will read this file and deploy automatically
-#   5. Once deployed, use https://<your-service>.onrender.com/mcp as your
-#      ChatGPT Custom MCP Server URL
-
 services:
   - type: web
     name: paybox-kreopoly-lens
@@ -17,7 +6,7 @@ services:
     region: oregon
     branch: main
     rootDir: .
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci && npx esbuild src/http.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/http.js && npx esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js && ls -la dist/
     startCommand: node dist/http.js
     healthCheckPath: /health
     autoDeploy: true
@@ -26,13 +15,3 @@ services:
         value: 20.0.0
       - key: POLYGON_RPC_URL
         value: https://polygon-rpc.com
-      - key: POLYGONSCAN_API_KEY
-        sync: false  # Set this in the Render dashboard after deploy
-      - key: WATCHLIST_PATH
-        value: /data/watchlist.json
-      - key: COPYTASKS_PATH
-        value: /data/copytasks.json
-    disk:
-      name: kreopoly-data
-      mountPath: /data
-      sizeGB: 1

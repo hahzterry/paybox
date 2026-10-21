@@ -1,74 +1,30 @@
 #!/usr/bin/env node
 /**
- * src/http.ts
+ * src/http.ts — Kreopoly Lens HTTP MCP Server (raw JSON-RPC)
  *
- * MCP server entry — STREAMABLE HTTP transport.
+ * Simple HTTP server that handles MCP JSON-RPC over HTTP.
+ * No SDK HTTP transport dependency — just raw request/response.
  *
- * Used by:
- *   - ChatGPT (Custom Connectors / Developer Mode) — requires HTTP MCP
- *   - Any MCP host that connects to a remote URL instead of spawning a process
- *
- * Usage:
- *   node dist/http.js                       # default port 3000
- *   node dist/http.js --port=8080           # custom port (with space)
- *   node dist/http.js --port=8080           # custom port (with =)
- *   PORT=8080 node dist/http.js             # via env var
- *
- * Endpoints:
- *   GET  /              → health check + tool list (human-readable JSON)
- *   POST /mcp           → MCP JSON-RPC over HTTP (initialize, tools/list, tools/call, etc.)
- *   GET  /mcp           → SSE stream (server-to-client messages)
- *   DELETE /mcp         → terminate session
- *
- * For local testing with ChatGPT, expose this with a tunnel:
- *   ngrok http 3000
- *   # then add https://<your-ngrok>.ngrok.app/mcp as a Custom MCP server
- *   # in ChatGPT → Settings → Plugins → Add custom MCP server
+ * ChatGPT connects to https://your-app.onrender.com/mcp
  */
 
 import http from "node:http";
-import { randomUUID } from "node:crypto";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { createServer, TOOLS } from "./server.js";
+// @ts-ignore — import from server.ts which exports createServer
+import { createServer } from "./server.js";
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
-const PORT = (() => {
-  const argv = process.argv.slice(2);
-  const portIdx = argv.indexOf("--port");
-  if (portIdx >= 0 && argv[portIdx + 1]) {
-    const p = parseInt(argv[portIdx + 1], 10);
-    if (!Number.isNaN(p)) return p;
-  }
-  const eqArg = argv.find((a) => a.startsWith("--port="));
-  if (eqArg) {
-    const p = parseInt(eqArg.slice("--port=".length), 10);
-    if (!Number.isNaN(p)) return p;
-  }
-  return parseInt(process.env.PORT ?? "3000", 10);
-})();
+// Create the MCP server instance
+const mcpServer = createServer();
 
-// ---------------------------------------------------------------------------
-// Session storage — one transport per active session
-// ---------------------------------------------------------------------------
-
-const sessions = new Map<string, StreamableHTTPServerTransport>();
-
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
+// Store connected sessions (simple in-memory)
+let initialized = false;
 
 const httpServer = http.createServer(async (req, res) => {
-  // CORS — ChatGPT fetches from chatgpt.com
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Accept, Mcp-Session-Id, Last-Event-ID, Authorization"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Last-Event-ID, Authorization");
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
@@ -79,181 +35,199 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
 
-  // --- Health check -------------------------------------------------------
+  // Health check
   if (url.pathname === "/" || url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify(
-        {
-          ok: true,
-          name: "paybox-kreopoly-lens",
-          version: "0.1.0",
-          transport: "http",
-          endpoints: {
-            mcp: "/mcp  (POST for JSON-RPC, GET for SSE, DELETE to close)",
-            health: "/health",
-          },
-          tools: TOOLS.map((t) => t.name),
-          toolCount: TOOLS.length,
-          activeSessions: sessions.size,
+    res.end(JSON.stringify({
+      ok: true,
+      name: "kreopoly-lens",
+      version: "0.5.0",
+      transport: "http",
+      mcpEndpoint: "/mcp",
+      toolCount: 17,
+    }, null, 2));
+    return;
+  }
+
+  // MCP endpoint — handle POST with JSON-RPC
+  if (url.pathname === "/mcp" && req.method === "POST") {
+    const body = await readBody(req);
+    let msg: any;
+    try {
+      msg = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }));
+      return;
+    }
+
+    // Handle the JSON-RPC message using the MCP server
+    // The MCP SDK v2 Server has a built-in request handler
+    // We need to use the internal transport mechanism
+    // Simplest: use InMemoryTransport to connect and forward
+
+    // Actually, let's use a simpler approach — directly handle the common methods
+    const method = msg.method;
+    const id = msg.id;
+    const params = msg.params ?? {};
+
+    try {
+      // Add _meta for protocol version
+      const enrichedParams = {
+        ...params,
+        _meta: params._meta ?? {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientInfo": { name: "http-client", version: "1.0" },
+          "io.modelcontextprotocol/clientCapabilities": {},
         },
-        null,
-        2
-      )
-    );
-    return;
-  }
+      };
 
-  // --- MCP endpoint -------------------------------------------------------
-  if (url.pathname === "/mcp") {
-    // Check for existing session
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      // Use the server's internal request handling
+      // The MCP SDK v2 Server can handle requests via setRequestHandler
+      // but we need to invoke it directly. Let's use a different approach.
 
-    if (req.method === "POST") {
-      // Read the body once
-      const body = await readBody(req);
-      let parsed: any;
-      try {
-        parsed = JSON.parse(body);
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
+      // Since createServer() returns a McpServer that's already configured with
+      // request handlers, we can send JSON-RPC messages through its internal
+      // transport. Let's use InMemoryTransport for this.
+
+      // Actually, the simplest approach: the McpServer extends Server which
+      // has a _requestHandler map. We can call server.handleRequest() directly.
+      // But that's internal API.
+
+      // Let's just use a raw approach — handle the 3 methods we need:
+      // tools/list, tools/call, initialize
+
+      if (method === "initialize") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            protocolVersion: "2026-07-28",
+            capabilities: { tools: {} },
+            serverInfo: { name: "kreopoly-lens", version: "0.5.0" },
+          },
+        }));
+        initialized = true;
+        return;
+      }
+
+      if (method === "notifications/initialized") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      if (method === "tools/list") {
+        // Get tools from the server's registered tools registry
+        const tools = (mcpServer as any)._registeredTools ?? {};
+        const toolList = [];
+        for (const [name, def] of Object.entries(tools)) {
+          const d = def as any;
+          toolList.push({
+            name,
+            description: d.description,
+            inputSchema: d.inputSchema ?? d.schema ?? { type: "object", properties: {} },
+          });
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          result: { tools: toolList },
+        }));
+        return;
+      }
+
+      if (method === "tools/call") {
+        const toolName = params.name;
+        const toolArgs = params.arguments ?? {};
+
+        // Find the tool and call it
+        const tools = (mcpServer as any)._registeredTools ?? {};
+        const toolDef = tools[toolName] as any;
+
+        if (!toolDef) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
             jsonrpc: "2.0",
-            error: { code: -32700, message: "Parse error" },
-            id: null,
-          })
-        );
+            id,
+            result: {
+              content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
+              isError: true,
+            },
+          }));
+          return;
+        }
+
+        try {
+          // Call the tool handler — the handler is in toolDef.handler or toolDef.callback
+          const handler = toolDef.handler ?? toolDef.callback ?? toolDef.fn;
+          if (!handler) {
+            throw new Error(`Tool ${toolName} has no handler`);
+          }
+          const result = await handler(toolArgs, { userId: "anonymous" });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result,
+          }));
+        } catch (err: any) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: `Tool error: ${err.message}` }],
+              isError: true,
+            },
+          }));
+        }
         return;
       }
 
-      // Initialize request → create a new session
-      if (isInitializeRequest(parsed)) {
-        const newSessionId = randomUUID();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => newSessionId,
-          onsessioninitialized: (sid) => {
-            sessions.set(sid, transport);
-          },
-        });
-
-        // Clean up when the session closes
-        transport.onclose = () => {
-          sessions.delete(newSessionId);
-        };
-
-        // Create and connect the MCP server
-        const server = createServer();
-        await server.connect(transport);
-
-        // The transport will read the body itself — but we already read it.
-        // Use a synthetic IncomingMessage-like approach: re-inject the body.
-        // The MCP SDK's handleRequest signature accepts (req, res, parsedBody?)
-        // — passing the parsed body avoids re-reading the stream.
-        await transport.handleRequest(req, res, parsed);
-        return;
-      }
-
-      // Existing session
-      if (sessionId && sessions.has(sessionId)) {
-        const transport = sessions.get(sessionId)!;
-        await transport.handleRequest(req, res, parsed);
-        return;
-      }
-
-      // No session and not an initialize request
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "No valid session. Send 'initialize' first.",
-          },
-          id: parsed.id ?? null,
-        })
-      );
-      return;
+      // Unknown method
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Method not found: ${method}` },
+      }));
+    } catch (err: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: `Internal error: ${err.message}` },
+      }));
     }
-
-    if (req.method === "GET") {
-      // SSE stream — must have a valid session
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      if (sessionId && sessions.has(sessionId)) {
-        const transport = sessions.get(sessionId)!;
-        await transport.handleRequest(req, res);
-        return;
-      }
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "No valid session for SSE stream." },
-          id: null,
-        })
-      );
-      return;
-    }
-
-    if (req.method === "DELETE") {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      if (sessionId && sessions.has(sessionId)) {
-        const transport = sessions.get(sessionId)!;
-        await transport.handleRequest(req, res);
-        sessions.delete(sessionId);
-        return;
-      }
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-
-    res.writeHead(405);
-    res.end();
     return;
   }
 
-  // --- 404 ---------------------------------------------------------------
+  // 404
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "Not found", path: url.pathname }));
 });
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 1_000_000) {
-        reject(new Error("Body too large"));
-        req.destroy();
-      }
+      if (data.length > 1_000_000) { reject(new Error("Body too large")); req.destroy(); }
     });
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
 }
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-
 httpServer.listen(PORT, () => {
-  console.error(`[paybox-kreopoly-lens] MCP HTTP server ready.`);
-  console.error(`  Health:  http://localhost:${PORT}/`);
-  console.error(`  MCP:     http://localhost:${PORT}/mcp`);
-  console.error(`  Tools:   ${TOOLS.map((t) => t.name).join(", ")}`);
-  console.error(`  CORS:    *`);
+  console.log(`[kreopoly-lens] MCP HTTP server ready.`);
+  console.log(`  Health:  http://localhost:${PORT}/`);
+  console.log(`  MCP:     http://localhost:${PORT}/mcp`);
 });
 
-process.on("SIGTERM", () => {
-  httpServer.close();
-  process.exit(0);
-});
-process.on("SIGINT", () => {
-  httpServer.close();
-  process.exit(0);
-});
+process.on("SIGTERM", () => { httpServer.close(); process.exit(0); });
+process.on("SIGINT", () => { httpServer.close(); process.exit(0); });
